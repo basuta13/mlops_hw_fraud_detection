@@ -1,47 +1,35 @@
-import pandas as pd
+"""Загрузка модели и скоринг транзакций."""
+import json
 import logging
+
+import pandas as pd
 from catboost import CatBoostClassifier
 
-# Настройка логгера
 logger = logging.getLogger(__name__)
+
+MODEL_PATH = './models/model.cbm'
+CONFIG_PATH = './models/model_config.json'
 
 logger.info('Importing pretrained model...')
 
-# Import model
 model = CatBoostClassifier()
-model.load_model('./models/my_catboost.cbm')
+model.load_model(MODEL_PATH)
 
-# Define optimal threshold
-model_th = 0.98
-logger.info('Pretrained model imported successfully...')
+# Порог подобран в ноутбуке обучения и сохранён вместе с моделью
+with open(CONFIG_PATH) as f:
+    model_config = json.load(f)
+model_th = model_config['threshold']
+
+logger.info('Pretrained model imported successfully. Threshold: %.4f', model_th)
 
 
-def make_pred(dt, source_info="kafka"):
+def make_pred(features: pd.DataFrame, source_info: str = 'kafka') -> pd.DataFrame:
+    """Возвращает таблицу с колонками score и fraud_flag."""
+    scores = model.predict_proba(features[model_config['features']])[:, 1]
 
-    print(dt.dtypes)
-
-    # Меняем формат категориальных фичей на string перед скорингом
-    expected_categorical = ['hour',
-                            'year',
-                            'month',
-                            'day_of_month',
-                            'day_of_week',
-                            'gender_cat',
-                            'merch_cat',
-                            'cat_id_cat',
-                            'one_city_cat',
-                            'us_state_cat',
-                            'jobs_cat']
-    for col in expected_categorical:
-        if col in dt.columns:
-            dt[col] = dt[col].astype(str)
-
-    # Calculate score
-    submission = pd.DataFrame({
-        'score':  model.predict_proba(dt)[:, 1],
-        'fraud_flag': (model.predict_proba(dt)[:, 1] > model_th) * 1
+    result = pd.DataFrame({
+        'score': scores,
+        'fraud_flag': (scores > model_th).astype(int),
     })
-    logger.info(f'Prediction complete for data from {source_info}')
-
-    # Return proba for positive class
-    return submission
+    logger.info('Prediction complete for data from %s', source_info)
+    return result

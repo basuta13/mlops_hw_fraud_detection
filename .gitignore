@@ -1,0 +1,10 @@
+# Данные соревнования не храним в репозитории (train.csv больше 100 МБ)
+fraud_detector/train_data/
+*.csv
+
+# Служебные файлы Python, Jupyter и CatBoost
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+catboost_info/
+.DS_Store

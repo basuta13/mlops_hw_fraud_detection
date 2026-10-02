@@ -1,110 +1,148 @@
 # Real-Time Fraud Detection System
 
-DISCLAIMER
+Сервис для обнаружения мошеннических транзакций в реальном времени: транзакции по одной приходят
+из Kafka, сервис скорит каждую моделью CatBoost и отправляет результат обратно в Kafka.
 
-Сервис подготовлен в демонстрационных целях для студентов курса МТС ШАД 2025 в рамках занятий по MLOps. Датасеты предоставлены в рамках соревнования https://www.kaggle.com/competitions/teta-ml-1-2025
+Домашнее задание по MLOps (МТС ШАД 2025). Основа — код семинара 4, данные — соревнование
+[teta-ml-1-2025](https://www.kaggle.com/competitions/teta-ml-1-2025).
 
-Система для обнаружения мошеннических транзакций в реальном времени с использованием ML-модели и Kafka для потоковой обработки данных.
+## Архитектура
 
-## 🏗️ Архитектура
+```
+Streamlit UI ──► Kafka: transactions ──► fraud_detector ──► Kafka: scores
+ (CSV → JSON)                          (препроцессинг →
+                                        модель → порог)
+```
 
-Компоненты системы:
-1. **`interface`** (Streamlit UI):
-   
-   Создан для удобной симуляции потоковых данных с транзакциями. Реальный продукт использовал бы прямой поток данных из других систем.
-    - Имитирует отправку транзакций в Kafka через CSV-файлы.
-    - Генерирует уникальные ID для транзакций.
-    - Загружает транзакции отдельными сообщениями формата JSON в топик kafka `transactions`.
-    
+1. **`interface`** (Streamlit, порт 8501) — имитирует поток транзакций: читает CSV формата `test.csv`,
+   присваивает каждой транзакции уникальный `transaction_id` и отправляет их по одной в топик `transactions`.
+2. **`fraud_detector`** — ML-сервис. Этапы разделены на отдельные скрипты:
+   - `app/app.py` — чтение сообщений из топика `transactions` и запись результата в топик `scores`;
+   - `src/preprocessing.py` — препроцессинг одной транзакции;
+   - `src/scorer.py` — загрузка модели и скоринг.
+3. **Kafka-инфраструктура** — Zookeeper, брокер Kafka, `kafka-setup` (создаёт топики при старте)
+   и Kafka UI (порт 8080) для просмотра сообщений.
 
-2. **`fraud_detector`** (ML Service):
-   - Загружает предобученную модель CatBoost (`my_catboost.cbm`).
-   - Выполняет препроцессинг данных:
-     - Извлечение временных признаков
-     - Гео-расстояния
-     - Кодирование категориальных переменных
-   - Производит скоринг с порогом 0.98.
-   - Выгружает результат скоринга в топик kafka `scoring`
+## Модель
 
-3. **Kafka Infrastructure**:
-   - Zookeeper + Kafka брокер
-   - `kafka-setup`: автоматически создает топики `transactions` и `scoring`
-   - Kafka UI: веб-интерфейс для мониторинга сообщений (порт 8080)
+- **CatBoostClassifier**, только inference на CPU. Модель обучена заранее в ноутбуке
+  [`notebooks/train_model.ipynb`](notebooks/train_model.ipynb) и лежит в `fraud_detector/models/`:
+  - `model.cbm` — веса модели;
+  - `model_config.json` — порог для `fraud_flag` и список признаков.
+- **Признаки** (`fraud_detector/src/preprocessing.py`):
+  - категориальные `merch`, `cat_id`, `gender`, `one_city`, `us_state`, `jobs` — CatBoost кодирует их сам;
+  - логарифм суммы `amount` и населения города `population_city`;
+  - координаты клиента и продавца и расстояние между ними (формула гаверсинусов);
+  - час и день недели транзакции.
+- Препроцессинг не зависит от тренировочных данных, поэтому каждая транзакция обрабатывается
+  отдельно, сразу как пришла из Kafka. Ноутбук обучения импортирует тот же `preprocessing.py`,
+  поэтому признаки при обучении и в сервисе совпадают.
+- **Качество на валидации (20% train):** ROC-AUC = 0.9958, F1 = 0.854.
+- **Порог** `fraud_flag` = 0.3266, подобран по максимуму F1 на валидации.
 
-## 🚀 Быстрый старт
+## Быстрый старт
 
 ### Требования
-- Docker 20.10+
-- Docker Compose 2.0+
+
+- Docker 20.10+ и Docker Compose 2.0+ (проверено на Docker Desktop 4.38, macOS, Apple Silicon)
+- Свободные порты 8080, 8501, 9095
 
 ### Запуск
+
 ```bash
-git clone https://github.com/your-repo/fraud-detection-system.git
-cd fraud-detection-system
-
-# Сборка и запуск всех сервисов
-docker-compose up --build
+git clone <ссылка на этот репозиторий>
+cd <папка репозитория>
+docker compose up --build
 ```
+
+Первый запуск занимает несколько минут: Docker скачивает образы и собирает сервисы.
+Сервис готов, когда в логах `fraud_detector` появилась строка:
+
+```
+Listening to topic "transactions", writing results to "scores"
+```
+
 После запуска:
-- **Streamlit UI**: http://localhost:8501
-- **Kafka UI**: http://localhost:8080
-- **Логи сервисов**: 
-  ```bash
-  docker-compose logs <service_name>  # Например: fraud_detector, kafka, interface
 
-## 🛠️ Использование
+- **Streamlit UI:** http://localhost:8501
+- **Kafka UI:** http://localhost:8080
 
-### 1. Загрузка данных:
+Остановка: `Ctrl+C`, затем `docker compose down`.
 
- - Загрузите CSV через интерфейс Streamlit. Для тестирования работы проекта используется файл формата `test.csv` из соревнования https://www.kaggle.com/competitions/teta-ml-1-2025
- - Пример структуры данных:
-    ```csv
-    transaction_time,amount,lat,lon,merchant_lat,merchant_lon,gender,...
-    2023-01-01 12:30:00,150.50,40.7128,-74.0060,40.7580,-73.9855,M,...
-    ```
- - Для первых тестов рекомендуется загружать небольшой семпл данных (до 100 транзакций) за раз, чтобы исполнение кода не заняло много времени.
+## Проверка работы
 
-### 2. Мониторинг:
- - **Kafka UI**: Просматривайте сообщения в топиках transactions и scoring
- - **Логи обработки**: /app/logs/service.log внутри контейнера fraud_detector
+1. Скачайте `test.csv` со [страницы соревнования](https://www.kaggle.com/competitions/teta-ml-1-2025/data).
+   Для быстрой проверки удобно взять первые 100 транзакций:
+   ```bash
+   head -n 101 test.csv > test_small.csv
+   ```
+2. Откройте http://localhost:8501, загрузите `test_small.csv` и нажмите **«Отправить test_small.csv»**.
+   Статус файла сменится на «Отправлен».
+3. Откройте http://localhost:8080 → **Topics**:
+   - в топике `transactions` (вкладка **Messages**) — отправленные транзакции;
+   - в топике `scores` — результаты скоринга, по одному сообщению на транзакцию:
+     ```json
+     {"transaction_id": "d6b0f7a0-8e1a-4a3c-9b2d-5c8f9d1e2f3a", "score": 0.0012, "fraud_flag": 0}
+     ```
+4. Логи сервиса скоринга:
+   ```bash
+   docker compose logs fraud_detector
+   ```
+   Для каждой транзакции там есть строка вида
+   `Transaction <id> scored: 0.0012 (fraud_flag=0)`.
+   Те же логи пишутся в файл `/app/logs/service.log` внутри контейнера.
 
-### 3. Результаты:
+## Переобучение модели (необязательно)
 
- - Скоринговые оценки пишутся в топик scoring в формате:
-    ```json
-    {
-    "score": 0.995, 
-    "fraud_flag": 1, 
-    "transaction_id": "d6b0f7a0-8e1a-4a3c-9b2d-5c8f9d1e2f3a"
-    }
-    ```
+Для запуска сервиса это не нужно: обученная модель уже лежит в репозитории.
+
+1. Положите `train.csv` из соревнования в `fraud_detector/train_data/`
+   (папка не хранится в git — файл больше 100 МБ).
+2. Создайте окружение с теми же версиями библиотек, что и в контейнере:
+   ```bash
+   conda create -n mlops python=3.12 -y
+   conda activate mlops
+   pip install catboost==1.2.8 pandas==2.2.3 numpy==2.2.6 scikit-learn==1.6.1 jupyter
+   ```
+3. Запустите все ячейки `notebooks/train_model.ipynb`. Ноутбук перезапишет
+   `fraud_detector/models/model.cbm` и `model_config.json`.
+4. Пересоберите сервис: `docker compose up --build`.
+
 ## Структура проекта
+
 ```
 .
 ├── fraud_detector/
-│   ├── preprocessing.py    # Логика препроцессинга
-│   ├── scorer.py           # ML-модель и предсказания
-│   ├── app.py              # Kafka Consumer/Producer
+│   ├── app/app.py              # Kafka consumer/producer: transactions → scores
+│   ├── src/preprocessing.py    # Препроцессинг транзакций
+│   ├── src/scorer.py           # Загрузка модели и скоринг
+│   ├── models/
+│   │   ├── model.cbm           # Обученная модель CatBoost
+│   │   └── model_config.json   # Порог и список признаков
+│   ├── requirements.txt
 │   └── Dockerfile
 ├── interface/
-│   └── app.py              # Streamlit UI
+│   ├── app.py                  # Streamlit UI
+│   └── Dockerfile
+├── notebooks/
+│   └── train_model.ipynb       # Обучение модели
 ├── docker-compose.yaml
 └── README.md
 ```
 
 ## Настройки Kafka
-```yml
-Топики:
-- transactions (входные данные)
-- scoring (результаты скоринга)
 
-Репликация: 1 (для разработки)
-Партиции: 3
-```
+| Топик          | Назначение                                        | Партиции |
+|----------------|---------------------------------------------------|----------|
+| `transactions` | входные транзакции из UI                          | 3        |
+| `scores`       | результаты скоринга: `transaction_id`, `score`, `fraud_flag` | 3        |
 
-*Примечание:* 
+Репликация: 1 (для разработки).
 
-Для полной функциональности убедитесь, что:
-1. Модель `my_catboost.cbm` размещена в `fraud_detector/models/`
-2. Тренировочные данные находятся в `fraud_detector/train_data/`
-3. Порты 8080, 8501 и 9095 свободны на хосте
+## Изменения относительно кода семинара
+
+- Своя модель и препроцессинг: препроцессинг не требует `train.csv` при запуске сервиса.
+- Топик результатов переименован из `scoring` в `scores`, как в задании; сообщение — один JSON-объект.
+- Образы Confluent обновлены с 7.3.0 до 7.6.1: Zookeeper 7.3.0 падал с
+  `NullPointerException ... CgroupV2Subsystem` на актуальных версиях Docker Desktop.
+- `fraud_detector` и `interface` стартуют только после того, как `kafka-setup` создал топики.
