@@ -9,9 +9,10 @@
 ## Архитектура
 
 ```
-Streamlit UI ──► Kafka: transactions ──► fraud_detector ──► Kafka: scores
- (CSV → JSON)                          (препроцессинг →
-                                        модель → порог)
+Streamlit UI ──► Kafka: transactions ──► fraud_detector ──► Kafka: scores ──► results_writer ──► Postgres
+ (CSV → JSON)                          (препроцессинг →                                        │
+      ▲                                 модель → порог)                                        │
+      └──────── раздел «Результаты скоринга»: последние фроды и гистограмма скоров ◄───────────┘
 ```
 
 1. **`interface`** (Streamlit, порт 8501) — имитирует поток транзакций: читает CSV формата `test.csv`,
@@ -20,8 +21,18 @@ Streamlit UI ──► Kafka: transactions ──► fraud_detector ──► Ka
    - `app/app.py` — чтение сообщений из топика `transactions` и запись результата в топик `scores`;
    - `src/preprocessing.py` — препроцессинг одной транзакции;
    - `src/scorer.py` — загрузка модели и скоринг.
-3. **Kafka-инфраструктура** — Zookeeper, брокер Kafka, `kafka-setup` (создаёт топики при старте)
+3. **`results_writer`** — отдельный сервис: читает топик `scores` (`transaction_id`, `score`, `fraud_flag`)
+   и складывает каждое сообщение в таблицу `transaction_scores` в Postgres.
+4. **`postgres`** — база данных с витриной `transaction_scores`. Таблица создаётся при старте
+   скриптом [`postgres/init.sql`](postgres/init.sql).
+5. **Kafka-инфраструктура** — Zookeeper, брокер Kafka, `kafka-setup` (создаёт топики при старте)
    и Kafka UI (порт 8080) для просмотра сообщений.
+
+В интерфейсе два раздела (переключатель в боковой панели слева):
+- **«Отправка транзакций»** — загрузка CSV и отправка в Kafka;
+- **«Результаты скоринга»** — по кнопке **«Посмотреть результаты»** показывает
+  10 последних транзакций с `fraud_flag = 1` и гистограмму скоров последних 100 транзакций
+  (или всех, если в базе их меньше 100).
 
 ## Модель
 
@@ -45,7 +56,7 @@ Streamlit UI ──► Kafka: transactions ──► fraud_detector ──► Ka
 ### Требования
 
 - Docker 20.10+ и Docker Compose 2.0+ (проверено на Docker Desktop 4.38, macOS, Apple Silicon)
-- Свободные порты 8080, 8501, 9095
+- Свободные порты 8080, 8501, 9095, 2181
 
 ### Запуск
 
@@ -84,12 +95,19 @@ Listening to topic "transactions", writing results to "scores"
      ```json
      {"transaction_id": "d6b0f7a0-8e1a-4a3c-9b2d-5c8f9d1e2f3a", "score": 0.0012, "fraud_flag": 0}
      ```
-4. Логи сервиса скоринга:
+4. Откройте в интерфейсе раздел **«📊 Результаты скоринга»** (боковая панель слева) и нажмите
+   **«Посмотреть результаты»**. Появятся таблица последних транзакций с `fraud_flag = 1` и гистограмма скоров.
+   Фрод встречается редко, поэтому в 100 транзакциях его может не оказаться. Чтобы увидеть
+   строки в таблице, отправьте выборку побольше: `head -n 2001 test.csv > test_2000.csv`.
+5. Содержимое витрины можно посмотреть и напрямую в базе:
    ```bash
-   docker compose logs fraud_detector
+   docker compose exec postgres psql -U fraud -d fraud_db -c "SELECT * FROM transaction_scores ORDER BY created_at DESC LIMIT 10;"
    ```
-   Для каждой транзакции там есть строка вида
-   `Transaction <id> scored: 0.0012 (fraud_flag=0)`.
+6. Логи сервисов:
+   ```bash
+   docker compose logs fraud_detector   # Transaction <id> scored: 0.0012 (fraud_flag=0)
+   docker compose logs results_writer   # Saved transaction <id> (fraud_flag=0)
+   ```
    Те же логи пишутся в файл `/app/logs/service.log` внутри контейнера.
 
 ## Переобучение модели (необязательно)
@@ -122,8 +140,15 @@ Listening to topic "transactions", writing results to "scores"
 │   ├── requirements.txt
 │   └── Dockerfile
 ├── interface/
-│   ├── app.py                  # Streamlit UI
+│   ├── app.py                  # Streamlit UI: отправка транзакций и результаты
+│   ├── requirements.txt
 │   └── Dockerfile
+├── results_writer/
+│   ├── app.py                  # Kafka consumer: scores → Postgres
+│   ├── requirements.txt
+│   └── Dockerfile
+├── postgres/
+│   └── init.sql                # Создание витрины transaction_scores
 ├── notebooks/
 │   └── train_model.ipynb       # Обучение модели
 ├── docker-compose.yaml
@@ -139,6 +164,21 @@ Listening to topic "transactions", writing results to "scores"
 
 Репликация: 1 (для разработки).
 
+## Витрина в Postgres
+
+База `fraud_db`, пользователь `fraud`, пароль `fraud` (только для локальной разработки).
+
+| Колонка          | Тип              | Описание                                   |
+|------------------|------------------|--------------------------------------------|
+| `id`             | SERIAL           | первичный ключ                             |
+| `transaction_id` | VARCHAR(64)      | ID транзакции, уникальный                  |
+| `score`          | DOUBLE PRECISION | скор модели                                |
+| `fraud_flag`     | SMALLINT         | 1 — фрод, 0 — нет                          |
+| `created_at`     | TIMESTAMP        | время записи, по нему выбираются последние |
+
+Повторно пришедшее сообщение с тем же `transaction_id` не дублируется (`ON CONFLICT DO NOTHING`).
+Данные хранятся внутри контейнера и очищаются после `docker compose down`.
+
 ## Изменения относительно кода семинара
 
 - Своя модель и препроцессинг: препроцессинг не требует `train.csv` при запуске сервиса.
@@ -146,3 +186,4 @@ Listening to topic "transactions", writing results to "scores"
 - Образы Confluent обновлены с 7.3.0 до 7.6.1: Zookeeper 7.3.0 падал с
   `NullPointerException ... CgroupV2Subsystem` на актуальных версиях Docker Desktop.
 - `fraud_detector` и `interface` стартуют только после того, как `kafka-setup` создал топики.
+- Добавлены Postgres с витриной, сервис `results_writer` и раздел «Результаты скоринга» в интерфейсе.
